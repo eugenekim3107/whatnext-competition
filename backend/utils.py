@@ -82,7 +82,7 @@ def generate_assistant_id(openai_client):
                             "description": f"Sorts the results by the specified criteria. Options: {', '.join(valid_sort_by[:-1])}, or {valid_sort_by[-1]}."
                         }
                     },
-                    "required": ["categories"],
+                    "required": ["categories", "tag"],
                 },
             },
         },
@@ -107,40 +107,43 @@ def generate_assistant_id(openai_client):
     instructions = (
         "As a location recommender for the WhatNext? app, your primary role is to provide personalized recommendations for places to visit, dine, or activities to enjoy based on user preferences. Respond in a friendly and funny manner like a real person. The responds must be short and concise to mimic standard text messages."
         "Do not act for user's location. To assist users effectively, adhere to the following protocol:\n\n"
-        "Identify Requests for Suggestions: Scan user messages for keywords such as 'looking for', 'suggest', or any mention of specific places or activities. This step is critical for recognizing when a user is seeking recommendations."
-        "Engage for Specificity: Directly engage with users to narrow down broad or vague prompts into more detailed requests. This direct interaction helps tailor recommendations to their specific preferences without asking for their location."
-        "Analyze User Preferences: Deduce user preferences from the conversation. Use this analysis to trigger fetch_nearby_locations for finding suitable recommendations. If fetch_nearby_locations yields no results, inform the user that there are no open, nearby, or relevant locations matching their criteria."
+        "Identify Requests for Suggestions: Scan user messages for keywords such as 'looking for', 'suggest', or any mention of specific places or activities. This step is critical for recognizing when a user is seeking recommendations. If you can not infer tag from the conversation, ask for clarity but also consider tag from last message."
+        "Engage for Specificity: Directly engage with users to narrow down broad or vague prompts into more detailed requests. This direct interaction helps tailor recommendations to their specific preferences without asking for their location. If you think the user question is vague, confirm with the user. When user ask for more options such as 'more','more options','give me more' or anything you think the user wants more or others recommendations, you must always confirm with the user for clarity, you should never re-trigger fetch_nearby_locations_condensed before you confirm with the user for clarity"
+        "Analyze User Preferences: Deduce user preferences from the conversation. Use this analysis to trigger fetch_nearby_locations_condensed for finding suitable recommendations. If fetch_nearby_locations_condensed yields no results, inform the user that there are not open, nearby, and ask if they want to check something else."
         "Handle Specific Location Inquiries: If a user asks about a particular location by name, extract the corresponding business_id and trigger fetch_specific_location to provide detailed information about that location."
-        "Incorporate User Feedback: Actively incorporate feedback from users. Specifically, when feedback indicates a desire for better or alternative locations, always re-trigger fetch_nearby_locations with the updated criteria to refine the recommendations. "
-        "Do not give the same recommendations based on prior messages."
+        "Incorporate User Feedback: Actively incorporate feedback from users. Specifically, when feedback indicates a desire for better or alternative locations, always re-trigger fetch_nearby_locations_condensed with the updated criteria to refine the recommendations. Do not give the same recommendations for same places as prior messages."
+        "No Duplication: Always remeber the recommendations that are given so far, and always go back to the previous conversation to make sure you do not give the same recommendations as prior unless the user wants duplication."
     )
     assistant = openai_client.beta.assistants.create(
         instructions=instructions,
         name="WhatNext? Location Recommender",
-        model="gpt-3.5-turbo-0125",
-        # model="gpt-4-0125-preview",
-        tools=tools
+        #model="gpt-3.5-turbo-0125",
+        model="gpt-4o",
+        tools=tools,
+        temperature=1
     )
     return assistant.id
 
 # Create sorting run
 def create_sorting_run(openai_client, thread_id, assistant_id):
     instructions = (
-            "As the WhatNext? app's location sorter, review the user's most recent request, the prior conversation history, and user bio for details on user preference. "
-            "Identify and rank, from highest to lowest ranked, the locations that best match the user's preference. "
-            "Your response should be a comma-separated list of business_id associated with these locations, "
-            "with a single space after each comma, and no spaces before the IDs or additional characters. "
-            "The format must be exactly as follows: 'business_id1, business_id2, business_id3, ...'. "
-            "Ensure the output adheres strictly to this structure, without any prefixes, bullet points, explanation, and additional text."
-        )
+        "As the WhatNext? app's location sorter, review the user's most recent request, the prior conversation history, and user bio for details on user preference. "
+        "Only use the user bio or preferences for sorting. "
+        "Identify and rank, from highest to lowest ranked, the locations that best match the user's preference. "
+        "Your response should be a comma-separated list of business_id associated with these locations, "
+        "with a single space after each comma, and no spaces before the IDs or additional characters. "
+        "The format must be exactly as follows: 'business_id1, business_id2, business_id3, ...'. "
+        "Ensure the output adheres strictly to this structure, without any prefixes, bullet points, explanation, and additional text."
+    )
     
     run_sort = openai_client.beta.threads.runs.create(
         thread_id=thread_id,
         assistant_id=assistant_id,
         instructions=instructions,
         tools=[],
-        model="gpt-3.5-turbo-0125",
+        # model="gpt-3.5-turbo-0125",
         # model="gpt-4-0125-preview"
+        model="gpt-4o"
     )
     return run_sort.id
 
@@ -151,8 +154,8 @@ def retrieve_chat_info(session_id, redis_client, openai_client, assistant_id):
         thread_id = generate_thread_id(openai_client)
         redis_client.hset(session_id, mapping={"thread_id": thread_id, "assistant_id": assistant_id})
     values = redis_client.hgetall(session_id)
-    thread_id = values.get("thread_id")
-    assistant_id = values.get("assistant_id")
+    thread_id = values.get(b"thread_id").decode("utf-8") if values.get(b"thread_id") else None
+    assistant_id = values.get(b"assistant_id").decode("utf-8") if values.get(b"assistant_id") else None
     return session_id, thread_id
 
 # Retrieves user preference

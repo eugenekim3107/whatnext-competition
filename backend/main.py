@@ -1,11 +1,9 @@
-from fastapi import FastAPI, Security, HTTPException, Depends, Query, Request
-from utils import *
-from fastapi.security.api_key import APIKeyHeader
+from fastapi import FastAPI, HTTPException, Query, Body, Depends
 from starlette.status import HTTP_403_FORBIDDEN
+from utils import *
 import motor.motor_asyncio
 from typing import List, Optional, Dict
 from pydantic import BaseModel, Field
-from typing import Optional
 from datetime import datetime
 from openai import OpenAI
 import redis
@@ -16,27 +14,47 @@ import os
 import pytz
 import random
 
+import pymongo
+from mistral_utils import (
+    initalize_sort_model,
+    initalize_chat_model, 
+    delete_session_id, 
+    add_message_to_session_id,
+    get_session_messages,
+    generate_session_id,
+)
+
 ##############################
 ### Setup and requirements ###
 ##############################
 
-# API key credentials
-# API_KEY_NAME = "WHATNEXT_API_KEY"
-# API_KEY = os.getenv(API_KEY_NAME)
-# api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 timeout = 30
 
 # MongoDB (make sure to change the ip address to match the ec2 instance ip address)
 MONGO_DETAILS = "mongodb://eugenekim:whatnext@172.17.0.1:27017/"
+# MONGO_DETAILS = "mongodb://eugenekim:whatnext@localhost:8000/"
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_DETAILS)
 db = mongo_client["whatnextDatabase"]
+
+# MongoDB without Async
+mongo_client_reg = pymongo.MongoClient(MONGO_DETAILS)
+db_reg = mongo_client_reg["whatnextDatabase"]
 
 # OpenAI
 openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 assistant_id = generate_assistant_id(openai_client)
 
 # Redis server for chat and user history
-redis_client = redis.Redis(host='172.17.0.1', port=6379, db=0, decode_responses=True)
+redis_url = 'redis://172.17.0.1:6379/0'
+# redis_url = "redis://localhost:8001/0"
+redis_client = redis.Redis.from_url(redis_url)
+
+# MistralAL setup
+api_key = os.environ["MISTRAL_API_KEY"]
+sort_model_name = "mistral-small-latest"
+chat_model_name = "mistral-large-latest"
+
+sort_model = initalize_sort_model(model_name=sort_model_name, api_key=api_key)
 
 app = FastAPI()
 
@@ -95,19 +113,17 @@ class TagsRequest(BaseModel):
     food_and_drinks_tag: Optional[List[str]]
     tags: Optional[List[str]]
 
+class VisitedUpdateRequest(BaseModel):
+    user_id:str
+    visited:Optional[List[str]]
+
+class FavoriteUpdateRequest(BaseModel):
+    user_id:str
+    favorites:Optional[List[str]]
+
 @app.get("/")
 async def status_check():
     return {"status": "ok"}
-
-# Verifies correct api key
-# async def get_api_key(api_key: str = Security(api_key_header)):
-#     api_key = "whatnext"
-#     if api_key == API_KEY:
-#         return api_key
-#     else:
-#         raise HTTPException(
-#             status_code=HTTP_403_FORBIDDEN, detail="Invalid API Key"
-#         )
 
 # Retrieve nearby locations
 async def fetch_nearby_locations(latitude: float, 
@@ -139,7 +155,8 @@ async def fetch_nearby_locations(latitude: float,
     query_with_tag = query_base.copy()
 
     if tag:
-        query_with_tag["tag"] = {"$in": tag}
+        query_with_tag["tag"] = {"$all": tag}
+
     pacific = pytz.timezone('America/Los_Angeles')
     now_utc = datetime.now(pytz.utc)
     now = now_utc.astimezone(pacific)
@@ -168,8 +185,6 @@ async def fetch_nearby_locations(latitude: float,
 
     try:
         locations = await query_and_process(query_with_tag)
-        if not locations and tag:
-            locations = await query_and_process(query_base)
         
         return locations
     except Exception as e:
@@ -203,8 +218,10 @@ async def fetch_nearby_locations_condensed(latitude: float,
         query_base["categories"] = {"$regex": regex_pattern, "$options": "i"}
 
     query_with_tag = query_base.copy()
+
     if tag:
-        query_with_tag["tag"] = {"$in": tag}
+        query_with_tag["tag"] = {"$all": tag}
+
     pacific = pytz.timezone('America/Los_Angeles')
     now_utc = datetime.now(pytz.utc)
     now = now_utc.astimezone(pacific)
@@ -232,8 +249,7 @@ async def fetch_nearby_locations_condensed(latitude: float,
 
     try:
         locations = await query_and_process(query_with_tag)
-        if not locations and tag:
-            locations = await query_and_process(query_base)
+
         return locations
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -511,6 +527,49 @@ async def chatgpt_response(request: ChatRequest):
         print(end-start)
         return {"user_id": user_id, "session_id": session_id, "content": personalized_locations, "chat_type": chat_type, "is_user_message": "false"}
 
+@app.post("/mistral_response")
+async def model_response(request: ChatRequest = Body(...)):
+    user_id = request.user_id
+    session_id = request.session_id
+    message = request.message
+    latitude = request.latitude
+    longitude = request.longitude
+
+    if session_id is None:
+        session_id = generate_session_id()
+    
+    add_message_to_session_id(message, session_id, redis_url, key_prefix="input")
+
+    chat_model = initalize_chat_model(model_name=chat_model_name, 
+                                      api_key=api_key, 
+                                      redis_url=redis_url, 
+                                      locations_db=db_reg["locationsv2"],
+                                      latitude=latitude, 
+                                      longitude=longitude, 
+                                      session_id=session_id, 
+                                      sort_model=sort_model)
+    
+    response = chat_model.invoke(
+        {
+            "input": message
+        },
+        {
+            "configurable": {"session_id": session_id}
+        }
+    )
+
+    delete_session_id(session_id, redis_url, key_prefix="input")
+
+    chat_type = "regular"
+    location_session_messages = get_session_messages(session_id, redis_url, key_prefix="locations")
+    chat_response = response["output"]
+
+    if len(location_session_messages) > 0:
+        chat_response = json.loads(location_session_messages[0].content)
+        chat_type = "locations"
+        delete_session_id(session_id, redis_url, key_prefix="locations")
+
+    return {"user_id": user_id, "session_id": session_id, "content": chat_response, "chat_type": chat_type, "is_user_message": "false"}
 
 #########################
 ### Profile Retrieval ###
@@ -609,14 +668,12 @@ async def favorites_info(request: ProfileRequest):
     locations = await fetch_favorites_info(user_id)
     return {"user_id": user_id, "favorites_locations": locations}
 
-
 @app.post("/tags_info")
 async def get_tags(request: ProfileRequest):
     user_id = request.user_id
     tags = await fetch_tags(user_id)
     tags['user_id'] = user_id
     return tags
-
 
 @app.post("/update_tags")
 async def update_tags(request:TagsRequest):
@@ -634,3 +691,23 @@ async def update_tags(request:TagsRequest):
         # No document was updated; either the user_id doesn't exist or the data was the same
         raise HTTPException(status_code=404, detail=f"No user found with user_id {request.user_id} or data was the same as existing")
     return {"operation": True, "user_id": request.user_id}
+
+@app.post("/update_visited")
+async def update_visited(request:VisitedUpdateRequest):
+    update_doc = {"visited":request.visited}
+    if not update_doc:
+         raise HTTPException(status_code=400, detail="No update data provided")
+    result = await db.users.update_one({"user_id":request.user_id},{"$set":update_doc})
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail=f"No user found with user_id {request.user_id} or data was the same as existing")
+    return {"operation":True,"user_id":request.user_id}
+
+@app.post("/update_favorites")
+async def update_favorites(request:FavoriteUpdateRequest):
+    update_doc = {"favorites":request.favorites}
+    if not update_doc:
+         raise HTTPException(status_code=400, detail="No update data provided")
+    result = await db.users.update_one({"user_id":request.user_id},{"$set":update_doc})
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail=f"No user found with user_id {request.user_id} or data was the same as existing")
+    return {"operation":True,"user_id":request.user_id}
