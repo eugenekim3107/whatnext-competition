@@ -1,3 +1,7 @@
+# Project Poster
+
+![WhatNext Project Poster](assets/whatnext-poster.png)
+
 # AWS Cloud Server Setup/Login
 
 ## AWS Console Login
