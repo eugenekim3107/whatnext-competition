@@ -1,8 +1,20 @@
-# Project Poster
+# WhatNext?
+
+A location-based recommendation platform that helps users discover nearby activities and experiences.
+
+## About
+
+### Project Overview
 
 ![WhatNext Project Poster](assets/whatnext-poster.png)
 
-# AWS Cloud Server Setup/Login
+### Recognition
+
+![WhatNext Certificate](assets/certificate.png)
+
+---
+
+## AWS Cloud Server Setup/Login
 
 ## AWS Console Login
   1. Log in to AWS console using registered account: https://d-9267bea535.awsapps.com/start
